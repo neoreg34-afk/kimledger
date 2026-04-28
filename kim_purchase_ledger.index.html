@@ -1,0 +1,1510 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>가루 김 매입 장부 — (주)아이디온 한국협농</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+KR:wght@500;700;900&family=Noto+Sans+KR:wght@300;400;500;700&display=swap" rel="stylesheet" />
+
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18.2.0/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
+  <script crossorigin src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.24.0/babel.min.js"></script>
+
+  <style>
+    body { margin: 0; font-family: "Noto Sans KR", system-ui, sans-serif; }
+    .serif { font-family: "Noto Serif KR", "Noto Serif", Georgia, serif; }
+    .num { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; }
+    .grain::before {
+      content: ""; position: absolute; inset: 0; pointer-events: none; opacity: 0.035;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    }
+    input[type="date"], input[type="number"], input[type="text"], input[type="url"], select, textarea {
+      font-family: "Noto Sans KR", system-ui, sans-serif;
+    }
+    input::placeholder, textarea::placeholder { color: #7d8471; opacity: 0.55; }
+    @keyframes leafFloat {
+      0%, 100% { transform: translateY(0) rotate(0deg); }
+      50% { transform: translateY(-6px) rotate(3deg); }
+    }
+    .leaf-anim { animation: leafFloat 6s ease-in-out infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spin-anim { animation: spin 1s linear infinite; }
+    #loading {
+      position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+      background: #faf9f6; color: #7d8471; font-family: "Noto Serif KR", serif; font-style: italic;
+      z-index: 9999; transition: opacity 0.4s;
+    }
+    #loading.hidden { opacity: 0; pointer-events: none; }
+    pre.code-block {
+      background: #1f3320; color: #faf9f6; padding: 16px; border-radius: 4px;
+      font-family: ui-monospace, "SF Mono", Monaco, Consolas, monospace; font-size: 11px;
+      overflow-x: auto; max-height: 240px; overflow-y: auto; line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <div id="loading">장부를 펼치는 중…</div>
+  <div id="root"></div>
+
+  <script type="text/babel" data-presets="react">
+    const { useState, useEffect, useMemo, Fragment, useRef } = React;
+    const {
+      ComposedChart, Bar, Line, XAxis, YAxis, Tooltip,
+      ResponsiveContainer, CartesianGrid, ReferenceLine,
+      AreaChart, Area
+    } = Recharts;
+
+    const C = {
+      forest: '#2d4a2b', forestDeep: '#1f3320', forestMid: '#3d5e3a',
+      sage: '#7d8471', sageLight: '#9aa28e',
+      olive: '#a4ac86', oliveLight: '#c8cca8', oliveSoft: '#dde0c8',
+      ivory: '#faf9f6', ivoryDeep: '#f0ede2', ivoryDeeper: '#e8e4d3',
+      ink: '#1a2818', warm: '#8b6f47', warmLight: '#b89968',
+      rust: '#a04a3a', rustLight: '#c87060', amber: '#c89b3c',
+      cloud: '#3b6cb0',
+    };
+
+    const PACKAGING = {
+      '60sok': { label: '60속 박스', short: '60속' },
+      '72sok': { label: '72속 박스', short: '72속' },
+    };
+
+    const fmt = (n) => new Intl.NumberFormat('ko-KR').format(Math.round(n || 0));
+    const fmt2 = (n) =>
+      new Intl.NumberFormat('ko-KR', { maximumFractionDigits: 2, minimumFractionDigits: 0 }).format(n || 0);
+    const fmtPrice = (n) => `${fmt(n)}원`;
+    const fmtGramPrice = (n) => `${fmt2(n)}원`;
+
+    const MONTHS = ['1월','2월','3월','4월','5월','6월','7월','8월','9월','10월','11월','12월'];
+
+    // ── localStorage 헬퍼 ──────────────────
+    const storage = {
+      get(key) { try { return localStorage.getItem(key); } catch { return null; } },
+      set(key, value) { try { localStorage.setItem(key, value); return true; } catch { return false; } },
+      remove(key) { try { localStorage.removeItem(key); } catch {} },
+    };
+
+    // ── Google Sheets 동기화 ───────────────
+    async function pullFromSheet(url) {
+      const res = await fetch(url, { method: 'GET', redirect: 'follow' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (data.ok === false) throw new Error(data.error || 'Sheet error');
+      return data;
+    }
+
+    async function pushToSheet(url, purchases, settings) {
+      const res = await fetch(url, {
+        method: 'POST',
+        // text/plain 으로 보내야 CORS preflight 회피됨
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ action: 'sync', purchases, settings }),
+        redirect: 'follow',
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (data.ok === false) throw new Error(data.error || 'Sync failed');
+      return data;
+    }
+
+    // ── Apps Script 코드 (사용자에게 제공) ──
+    const APPS_SCRIPT_CODE = `function doGet(e) { return handle('get', null); }
+function doPost(e) {
+  let body = {};
+  try { body = JSON.parse(e.postData.contents); } catch (_) {}
+  return handle('post', body);
+}
+function handle(method, body) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const HEADERS = ['id','date','packagingType','boxWeightGrams','pricePerBox','pricePerGram','boxes','supplier','memo'];
+    const pSheet = getOrCreate(ss, 'purchases', HEADERS);
+    const sSheet = getOrCreate(ss, 'settings', ['key','value']);
+    if (method === 'post' && body && body.action === 'sync') {
+      const purchases = body.purchases || [];
+      const last = pSheet.getLastRow();
+      if (last > 1) pSheet.getRange(2, 1, last - 1, 9).clearContent();
+      if (purchases.length > 0) {
+        const rows = purchases.map(p => [
+          p.id || '', p.date || '', p.packagingType || '60sok',
+          Number(p.boxWeightGrams) || 0, Number(p.pricePerBox) || 0, Number(p.pricePerGram) || 0,
+          Number(p.boxes) || 0, p.supplier || '', p.memo || ''
+        ]);
+        pSheet.getRange(2, 1, rows.length, 9).setValues(rows);
+      }
+      const settings = body.settings || {};
+      const sLast = sSheet.getLastRow();
+      if (sLast > 1) sSheet.getRange(2, 1, sLast - 1, 2).clearContent();
+      if (settings.targetPrice !== undefined) {
+        sSheet.appendRow(['targetPrice', Number(settings.targetPrice) || 0]);
+      }
+    }
+    const purchases = [];
+    const pData = pSheet.getDataRange().getValues();
+    for (let i = 1; i < pData.length; i++) {
+      const r = pData[i];
+      if (!r[0]) continue;
+      purchases.push({
+        id: String(r[0]),
+        date: r[1] instanceof Date
+          ? Utilities.formatDate(r[1], Session.getScriptTimeZone() || 'Asia/Seoul', 'yyyy-MM-dd')
+          : String(r[1]),
+        packagingType: String(r[2] || '60sok'),
+        boxWeightGrams: Number(r[3]) || 0,
+        pricePerBox: Number(r[4]) || 0,
+        pricePerGram: Number(r[5]) || 0,
+        boxes: Number(r[6]) || 0,
+        supplier: String(r[7] || ''),
+        memo: String(r[8] || ''),
+      });
+    }
+    let targetPrice = 0;
+    const sData = sSheet.getDataRange().getValues();
+    for (let i = 1; i < sData.length; i++) {
+      if (sData[i][0] === 'targetPrice') targetPrice = Number(sData[i][1]) || 0;
+    }
+    return ContentService.createTextOutput(JSON.stringify({
+      ok: true, purchases, settings: { targetPrice }
+    })).setMimeType(ContentService.MimeType.JSON);
+  } catch (err) {
+    return ContentService.createTextOutput(JSON.stringify({
+      ok: false, error: String(err.message || err)
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+}
+function getOrCreate(ss, name, headers) {
+  let s = ss.getSheetByName(name);
+  if (!s) { s = ss.insertSheet(name); s.appendRow(headers); }
+  return s;
+}`;
+
+    // ── Inline SVG icons ────────────
+    const Svg = ({ size = 16, strokeWidth = 1.5, className = '', style = {}, children }) => (
+      <svg width={size} height={size} viewBox="0 0 24 24" fill="none"
+           stroke="currentColor" strokeWidth={strokeWidth}
+           strokeLinecap="round" strokeLinejoin="round"
+           className={className} style={style}>{children}</svg>
+    );
+    const Plus = (p) => <Svg {...p}><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></Svg>;
+    const Trash2 = (p) => <Svg {...p}><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></Svg>;
+    const Target = (p) => <Svg {...p}><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></Svg>;
+    const TrendingUp = (p) => <Svg {...p}><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/></Svg>;
+    const TrendingDown = (p) => <Svg {...p}><polyline points="22 17 13.5 8.5 8.5 13.5 2 7"/><polyline points="16 17 22 17 22 11"/></Svg>;
+    const Package = (p) => <Svg {...p}><line x1="16.5" y1="9.4" x2="7.5" y2="4.21"/><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></Svg>;
+    const Calendar = (p) => <Svg {...p}><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></Svg>;
+    const CalendarDays = (p) => <Svg {...p}><rect width="18" height="18" x="3" y="4" rx="2" ry="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/><path d="M8 14h.01"/><path d="M12 14h.01"/><path d="M16 14h.01"/><path d="M8 18h.01"/><path d="M12 18h.01"/><path d="M16 18h.01"/></Svg>;
+    const Leaf = (p) => <Svg {...p}><path d="M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.48 19.2 2.96c.6 6.5-1.5 9.42-4.7 12.5-2.6 2.5-4.5 4-7.5 4z"/><path d="M2 21c0-3 1.85-5.36 5.08-6"/></Svg>;
+    const Layers = (p) => <Svg {...p}><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></Svg>;
+    const Scale = (p) => <Svg {...p}><path d="m16 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z"/><path d="m2 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z"/><path d="M7 21h10"/><path d="M12 3v18"/><path d="M3 7h2c2 0 5-1 7-2 2 1 5 2 7 2h2"/></Svg>;
+    const Activity = (p) => <Svg {...p}><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></Svg>;
+    const Cloud = (p) => <Svg {...p}><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></Svg>;
+    const CloudOff = (p) => <Svg {...p}><path d="m2 2 20 20"/><path d="M5.782 5.782A7 7 0 0 0 9 19h8.5a4.5 4.5 0 0 0 1.307-.193"/><path d="M21.532 16.5A4.5 4.5 0 0 0 17.5 10h-1.79A7.008 7.008 0 0 0 10 5.5"/></Svg>;
+    const RefreshCw = (p) => <Svg {...p}><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></Svg>;
+    const Check = (p) => <Svg {...p}><polyline points="20 6 9 17 4 12"/></Svg>;
+    const AlertCircle = (p) => <Svg {...p}><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></Svg>;
+    const Copy = (p) => <Svg {...p}><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></Svg>;
+    const X = (p) => <Svg {...p}><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></Svg>;
+    const ExternalLink = (p) => <Svg {...p}><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></Svg>;
+
+    // ─────────────────────────────────────────────
+    function KimPurchaseLedger() {
+      const [purchases, setPurchases] = useState([]);
+      const [targetPrice, setTargetPrice] = useState(0);
+
+      const today = new Date().toISOString().slice(0, 10);
+      const [date, setDate] = useState(today);
+      const [packagingType, setPackagingType] = useState('60sok');
+      const [boxWeightGrams, setBoxWeightGrams] = useState('');
+      const [pricePerBox, setPricePerBox] = useState('');
+      const [pricePerGram, setPricePerGram] = useState('');
+      const [boxes, setBoxes] = useState('');
+      const [supplier, setSupplier] = useState('');
+      const [memo, setMemo] = useState('');
+
+      const [showSettings, setShowSettings] = useState(false);
+      const [targetInput, setTargetInput] = useState('');
+      const [filterYear, setFilterYear] = useState('all');
+      const [filterPackaging, setFilterPackaging] = useState('all');
+
+      // 클라우드 동기화 state
+      const [sheetsUrl, setSheetsUrl] = useState('');
+      const [syncStatus, setSyncStatus] = useState('idle'); // idle | syncing | synced | error | offline
+      const [syncMessage, setSyncMessage] = useState('');
+      const [lastSyncTime, setLastSyncTime] = useState(null);
+      const [showSync, setShowSync] = useState(false);
+
+      // ── load on mount ──
+      useEffect(() => {
+        const url = storage.get('kim:sheetsUrl') || '';
+        setSheetsUrl(url);
+
+        const loadLocal = () => {
+          const p = storage.get('kim:purchases');
+          if (p) { try { setPurchases(JSON.parse(p)); } catch {} }
+          const s = storage.get('kim:settings');
+          if (s) {
+            try {
+              const obj = JSON.parse(s);
+              if (obj.targetPrice) {
+                setTargetPrice(obj.targetPrice);
+                setTargetInput(String(obj.targetPrice));
+              }
+            } catch {}
+          }
+        };
+
+        // 로컬 먼저 로드 (빠른 표시)
+        loadLocal();
+
+        // 시트 URL 있으면 시트에서 가져와서 덮어쓰기
+        if (url) {
+          setSyncStatus('syncing');
+          pullFromSheet(url)
+            .then((data) => {
+              if (data.purchases) {
+                setPurchases(data.purchases);
+                storage.set('kim:purchases', JSON.stringify(data.purchases));
+              }
+              if (data.settings && data.settings.targetPrice !== undefined) {
+                setTargetPrice(data.settings.targetPrice);
+                setTargetInput(String(data.settings.targetPrice));
+                storage.set('kim:settings', JSON.stringify(data.settings));
+              }
+              setSyncStatus('synced');
+              setLastSyncTime(Date.now());
+            })
+            .catch((err) => {
+              setSyncStatus('error');
+              setSyncMessage(String(err.message || err));
+            });
+        }
+
+        const el = document.getElementById('loading');
+        if (el) { el.classList.add('hidden'); setTimeout(() => el.remove(), 500); }
+      }, []);
+
+      function syncFromBox(value) {
+        setPricePerBox(value);
+        const v = parseFloat(value);
+        const w = parseFloat(boxWeightGrams);
+        if (value !== '' && !isNaN(v) && v >= 0 && !isNaN(w) && w > 0) {
+          setPricePerGram((v / w).toFixed(2));
+        } else if (value === '') {
+          setPricePerGram('');
+        }
+      }
+      function syncFromGram(value) {
+        setPricePerGram(value);
+        const v = parseFloat(value);
+        const w = parseFloat(boxWeightGrams);
+        if (value !== '' && !isNaN(v) && v >= 0 && !isNaN(w) && w > 0) {
+          setPricePerBox(Math.round(v * w).toString());
+        } else if (value === '') {
+          setPricePerBox('');
+        }
+      }
+      function syncFromWeight(value) {
+        setBoxWeightGrams(value);
+        const w = parseFloat(value);
+        const b = parseFloat(pricePerBox);
+        if (pricePerBox !== '' && !isNaN(b) && b >= 0 && !isNaN(w) && w > 0) {
+          setPricePerGram((b / w).toFixed(2));
+        }
+      }
+
+      async function pushIfConnected(list, settings) {
+        if (!sheetsUrl) return;
+        setSyncStatus('syncing');
+        try {
+          await pushToSheet(sheetsUrl, list, settings);
+          setSyncStatus('synced');
+          setSyncMessage('');
+          setLastSyncTime(Date.now());
+        } catch (err) {
+          setSyncStatus('error');
+          setSyncMessage(String(err.message || err));
+        }
+      }
+
+      function savePurchases(list) {
+        setPurchases(list);
+        storage.set('kim:purchases', JSON.stringify(list));
+        pushIfConnected(list, { targetPrice });
+      }
+
+      function saveTarget(v) {
+        setTargetPrice(v);
+        storage.set('kim:settings', JSON.stringify({ targetPrice: v }));
+        pushIfConnected(purchases, { targetPrice: v });
+      }
+
+      function handleAdd(e) {
+        e.preventDefault();
+        if (!date || !pricePerBox || !boxes) return;
+        const newP = {
+          id: Date.now().toString() + Math.random().toString(36).slice(2, 6),
+          date, packagingType,
+          boxWeightGrams: parseFloat(boxWeightGrams) || 0,
+          pricePerBox: parseFloat(pricePerBox),
+          pricePerGram: pricePerGram ? parseFloat(pricePerGram) : 0,
+          boxes: parseInt(boxes, 10),
+          supplier: supplier.trim(),
+          memo: memo.trim(),
+        };
+        const next = [...purchases, newP].sort((a, b) => b.date.localeCompare(a.date));
+        savePurchases(next);
+        setPricePerBox(''); setPricePerGram(''); setBoxes(''); setSupplier(''); setMemo('');
+      }
+      function handleDelete(id) {
+        if (!confirm('이 거래 기록을 삭제할까요?')) return;
+        savePurchases(purchases.filter((p) => p.id !== id));
+      }
+      function handleSaveTarget() {
+        const v = parseFloat(targetInput);
+        if (!isNaN(v) && v >= 0) { saveTarget(v); setShowSettings(false); }
+      }
+
+      // 동기화 연결
+      async function handleSyncConnect(url) {
+        const trimmed = (url || '').trim();
+        if (!trimmed) return { ok: false, error: 'URL을 입력해주세요' };
+        setSyncStatus('syncing');
+        setSyncMessage('');
+        try {
+          // 먼저 로컬 데이터를 시트에 푸시 (시트가 비어있으면 로컬 데이터로 채움)
+          const sheetData = await pullFromSheet(trimmed);
+          if (sheetData.purchases && sheetData.purchases.length > 0) {
+            // 시트에 데이터가 있으면 시트 데이터를 사용
+            setPurchases(sheetData.purchases);
+            storage.set('kim:purchases', JSON.stringify(sheetData.purchases));
+            if (sheetData.settings && sheetData.settings.targetPrice !== undefined) {
+              setTargetPrice(sheetData.settings.targetPrice);
+              setTargetInput(String(sheetData.settings.targetPrice));
+              storage.set('kim:settings', JSON.stringify(sheetData.settings));
+            }
+          } else if (purchases.length > 0) {
+            // 로컬에만 데이터 있으면 시트에 푸시
+            await pushToSheet(trimmed, purchases, { targetPrice });
+          }
+          storage.set('kim:sheetsUrl', trimmed);
+          setSheetsUrl(trimmed);
+          setSyncStatus('synced');
+          setLastSyncTime(Date.now());
+          return { ok: true };
+        } catch (err) {
+          setSyncStatus('error');
+          setSyncMessage(String(err.message || err));
+          return { ok: false, error: String(err.message || err) };
+        }
+      }
+
+      function handleSyncDisconnect() {
+        if (!confirm('동기화를 해제할까요? 로컬 데이터는 유지됩니다.')) return;
+        storage.remove('kim:sheetsUrl');
+        setSheetsUrl('');
+        setSyncStatus('idle');
+        setSyncMessage('');
+        setShowSync(false);
+      }
+
+      async function handleManualSync() {
+        if (!sheetsUrl) return;
+        setSyncStatus('syncing');
+        try {
+          const data = await pullFromSheet(sheetsUrl);
+          if (data.purchases) {
+            setPurchases(data.purchases);
+            storage.set('kim:purchases', JSON.stringify(data.purchases));
+          }
+          if (data.settings && data.settings.targetPrice !== undefined) {
+            setTargetPrice(data.settings.targetPrice);
+            setTargetInput(String(data.settings.targetPrice));
+            storage.set('kim:settings', JSON.stringify(data.settings));
+          }
+          setSyncStatus('synced');
+          setSyncMessage('');
+          setLastSyncTime(Date.now());
+        } catch (err) {
+          setSyncStatus('error');
+          setSyncMessage(String(err.message || err));
+        }
+      }
+
+      const allYears = useMemo(
+        () => [...new Set(purchases.map((p) => p.date.slice(0, 4)))].sort(),
+        [purchases]
+      );
+
+      const filtered = useMemo(() => {
+        let list = purchases;
+        if (filterYear !== 'all') list = list.filter((p) => p.date.slice(0, 4) === filterYear);
+        if (filterPackaging !== 'all') list = list.filter((p) => (p.packagingType || '60sok') === filterPackaging);
+        return list;
+      }, [purchases, filterYear, filterPackaging]);
+
+      const yearlyStats = useMemo(() => {
+        const map = {};
+        purchases.forEach((p) => {
+          const y = p.date.slice(0, 4);
+          if (!map[y]) map[y] = { totalBoxes: 0, totalCost: 0, totalGrams: 0, gramCost: 0, prices: [], gramPrices: [], count: 0 };
+          map[y].totalBoxes += p.boxes;
+          map[y].totalCost += p.pricePerBox * p.boxes;
+          if (p.boxWeightGrams && p.boxWeightGrams > 0) {
+            map[y].totalGrams += p.boxWeightGrams * p.boxes;
+            map[y].gramCost += p.pricePerBox * p.boxes;
+          }
+          map[y].prices.push(p.pricePerBox);
+          if (p.pricePerGram > 0) map[y].gramPrices.push(p.pricePerGram);
+          map[y].count += 1;
+        });
+        return Object.entries(map).map(([year, s]) => ({
+          year,
+          totalBoxes: s.totalBoxes,
+          avgPrice: s.totalBoxes > 0 ? Math.round(s.totalCost / s.totalBoxes) : 0,
+          avgGramPrice: s.totalGrams > 0 ? s.gramCost / s.totalGrams : 0,
+          minPrice: Math.min(...s.prices),
+          maxPrice: Math.max(...s.prices),
+          minGramPrice: s.gramPrices.length ? Math.min(...s.gramPrices) : 0,
+          maxGramPrice: s.gramPrices.length ? Math.max(...s.gramPrices) : 0,
+          transactions: s.count,
+        })).sort((a, b) => a.year.localeCompare(b.year));
+      }, [purchases]);
+
+      const overall = useMemo(() => {
+        if (purchases.length === 0)
+          return { avgBox: 0, avgGram: 0, minBox: 0, maxBox: 0, minGram: 0, maxGram: 0, totalBoxes: 0, totalGrams: 0 };
+        const totalCost = purchases.reduce((s, p) => s + p.pricePerBox * p.boxes, 0);
+        const totalBoxes = purchases.reduce((s, p) => s + p.boxes, 0);
+        let totalGrams = 0, gramCost = 0;
+        purchases.forEach((p) => {
+          if (p.boxWeightGrams && p.boxWeightGrams > 0) {
+            totalGrams += p.boxWeightGrams * p.boxes;
+            gramCost += p.pricePerBox * p.boxes;
+          }
+        });
+        const boxPrices = purchases.map((p) => p.pricePerBox);
+        const gramPrices = purchases.map((p) => p.pricePerGram).filter((v) => v && !isNaN(v));
+        return {
+          avgBox: totalBoxes > 0 ? totalCost / totalBoxes : 0,
+          avgGram: totalGrams > 0 ? gramCost / totalGrams : 0,
+          minBox: Math.min(...boxPrices),
+          maxBox: Math.max(...boxPrices),
+          minGram: gramPrices.length ? Math.min(...gramPrices) : 0,
+          maxGram: gramPrices.length ? Math.max(...gramPrices) : 0,
+          totalBoxes, totalGrams,
+        };
+      }, [purchases]);
+
+      const byPackaging = useMemo(() => {
+        return Object.keys(PACKAGING).map((type) => {
+          const items = purchases.filter((p) => (p.packagingType || '60sok') === type);
+          if (items.length === 0) {
+            return { type, label: PACKAGING[type].label, empty: true, count: 0, totalBoxes: 0, totalGrams: 0 };
+          }
+          const totalCost = items.reduce((s, p) => s + p.pricePerBox * p.boxes, 0);
+          const totalBoxes = items.reduce((s, p) => s + p.boxes, 0);
+          let totalGrams = 0, gramCost = 0;
+          items.forEach((p) => {
+            if (p.boxWeightGrams && p.boxWeightGrams > 0) {
+              totalGrams += p.boxWeightGrams * p.boxes;
+              gramCost += p.pricePerBox * p.boxes;
+            }
+          });
+          const boxPrices = items.map((p) => p.pricePerBox);
+          const gramPrices = items.map((p) => p.pricePerGram).filter((v) => v && !isNaN(v));
+          return {
+            type, label: PACKAGING[type].label, empty: false,
+            count: items.length, totalBoxes, totalGrams,
+            avgBoxPrice: totalCost / totalBoxes,
+            avgGramPrice: totalGrams > 0 ? gramCost / totalGrams : 0,
+            minBoxPrice: Math.min(...boxPrices),
+            maxBoxPrice: Math.max(...boxPrices),
+            minGramPrice: gramPrices.length ? Math.min(...gramPrices) : 0,
+            maxGramPrice: gramPrices.length ? Math.max(...gramPrices) : 0,
+          };
+        });
+      }, [purchases]);
+
+      const filteredStats = useMemo(() => {
+        if (filtered.length === 0) return { avgBox: 0, avgGram: 0, minBox: 0, maxBox: 0, boxes: 0, grams: 0 };
+        const totalCost = filtered.reduce((s, p) => s + p.pricePerBox * p.boxes, 0);
+        const totalBoxes = filtered.reduce((s, p) => s + p.boxes, 0);
+        let totalGrams = 0, gramCost = 0;
+        filtered.forEach((p) => {
+          if (p.boxWeightGrams && p.boxWeightGrams > 0) {
+            totalGrams += p.boxWeightGrams * p.boxes;
+            gramCost += p.pricePerBox * p.boxes;
+          }
+        });
+        const boxPrices = filtered.map((p) => p.pricePerBox);
+        return {
+          avgBox: totalBoxes > 0 ? totalCost / totalBoxes : 0,
+          avgGram: totalGrams > 0 ? gramCost / totalGrams : 0,
+          minBox: Math.min(...boxPrices),
+          maxBox: Math.max(...boxPrices),
+          boxes: totalBoxes, grams: totalGrams,
+        };
+      }, [filtered]);
+
+      const recentTrend = useMemo(() => {
+        return [...purchases]
+          .sort((a, b) => a.date.localeCompare(b.date))
+          .slice(-30)
+          .map((p) => ({ date: p.date.slice(5), box: p.pricePerBox, gram: p.pricePerGram || 0 }));
+      }, [purchases]);
+
+      const monthlyHeatmap = useMemo(() => {
+        if (purchases.length === 0) return null;
+        const map = {};
+        let maxCount = 0;
+        purchases.forEach((p) => {
+          const y = parseInt(p.date.slice(0, 4), 10);
+          const m = parseInt(p.date.slice(5, 7), 10);
+          const key = `${y}-${m}`;
+          if (!map[key]) map[key] = { year: y, month: m, boxes: 0, count: 0 };
+          map[key].boxes += p.boxes;
+          map[key].count += 1;
+          if (map[key].boxes > maxCount) maxCount = map[key].boxes;
+        });
+        const yrs = [...new Set(purchases.map((p) => parseInt(p.date.slice(0, 4), 10)))].sort();
+        return { map, maxCount, years: yrs };
+      }, [purchases]);
+
+      const priceVsTarget = useMemo(() => {
+        if (!targetPrice || !overall.avgBox) return null;
+        const diff = overall.avgBox - targetPrice;
+        const pct = (diff / targetPrice) * 100;
+        return { diff, pct };
+      }, [targetPrice, overall.avgBox]);
+
+      return (
+        <div className="min-h-screen w-full" style={{
+          background: `radial-gradient(ellipse at top, ${C.ivoryDeep} 0%, ${C.ivory} 60%)`,
+          fontFamily: '"Noto Sans KR", system-ui, sans-serif',
+          color: C.ink,
+        }}>
+          <div className="max-w-7xl mx-auto px-6 py-10">
+            {/* HEADER */}
+            <header className="relative mb-10 pb-8" style={{ borderBottom: `1px solid ${C.olive}` }}>
+              <div className="absolute top-0 right-0 opacity-10 pointer-events-none">
+                <svg width="180" height="120" viewBox="0 0 180 120" fill="none">
+                  <path d="M10 60 Q 50 20, 90 60 T 170 60" stroke={C.forest} strokeWidth="2" fill="none" />
+                  <ellipse cx="40" cy="40" rx="14" ry="6" fill={C.forest} transform="rotate(-30 40 40)" />
+                  <ellipse cx="120" cy="80" rx="16" ry="7" fill={C.forest} transform="rotate(20 120 80)" />
+                  <ellipse cx="80" cy="35" rx="12" ry="5" fill={C.sage} transform="rotate(15 80 35)" />
+                </svg>
+              </div>
+              <div className="flex items-start justify-between gap-4 flex-wrap relative">
+                <div>
+                  <div className="flex items-center gap-3 mb-3">
+                    <Leaf size={20} style={{ color: C.sage }} className="leaf-anim" />
+                    <span className="text-xs uppercase tracking-[0.3em]" style={{ color: C.sage, letterSpacing: '0.3em' }}>
+                      (주)아이디온 한국협농
+                    </span>
+                  </div>
+                  <h1 className="serif text-5xl md:text-6xl font-black leading-tight mb-2"
+                      style={{ color: C.forestDeep, letterSpacing: '-0.02em' }}>
+                    가루 김 매입 장부
+                  </h1>
+                  <p className="serif text-lg italic" style={{ color: C.sage }}>
+                    Dried Seaweed Purchase Ledger · 2026 — 2999
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <SyncIndicator
+                    status={syncStatus}
+                    connected={!!sheetsUrl}
+                    onClick={() => setShowSync(true)}
+                    onRefresh={handleManualSync}
+                    lastSyncTime={lastSyncTime}
+                  />
+                  <button onClick={() => { setTargetInput(String(targetPrice || '')); setShowSettings(true); }}
+                    className="flex items-center gap-2 px-5 py-3 rounded-sm transition-all hover:opacity-90"
+                    style={{ background: 'transparent', border: `1px solid ${C.forest}`, color: C.forest, fontSize: '14px' }}>
+                    <Target size={16} /> 적정 단가 설정
+                  </button>
+                </div>
+              </div>
+            </header>
+
+            {/* HERO STATS */}
+            <section className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+              <HeroStat label="전체 평균 박스가" value={fmtPrice(overall.avgBox)}
+                sub={`g당 ${fmtGramPrice(overall.avgGram)}`}
+                accent={C.forest} icon={<Package size={18} />}
+                trend={recentTrend.map((t) => ({ v: t.box }))} />
+              <HeroStat label="박스 최저가" value={overall.minBox ? fmtPrice(overall.minBox) : '—'}
+                sub={overall.minGram ? `g당 ${fmtGramPrice(overall.minGram)}` : '역대 최저'}
+                accent={C.forest} icon={<TrendingDown size={18} />} />
+              <HeroStat label="박스 최고가" value={overall.maxBox ? fmtPrice(overall.maxBox) : '—'}
+                sub={overall.maxGram ? `g당 ${fmtGramPrice(overall.maxGram)}` : '역대 최고'}
+                accent={C.rust} icon={<TrendingUp size={18} />} />
+              <HeroStat label="적정 단가" value={targetPrice ? fmtPrice(targetPrice) : '미설정'}
+                sub={priceVsTarget ? `${priceVsTarget.diff >= 0 ? '+' : ''}${fmt(priceVsTarget.diff)}원 (${priceVsTarget.pct >= 0 ? '+' : ''}${priceVsTarget.pct.toFixed(1)}%)` : '클릭하여 설정'}
+                accent={priceVsTarget ? (priceVsTarget.diff > 0 ? C.rust : C.forest) : C.sage}
+                icon={<Target size={18} />} />
+            </section>
+
+            {/* SUMMARY BANNER */}
+            {purchases.length > 0 && (
+              <section className="mb-10 p-5 rounded-sm grid grid-cols-2 md:grid-cols-4 gap-4 relative grain"
+                style={{ background: `linear-gradient(135deg, ${C.forestDeep} 0%, ${C.forest} 100%)`, color: C.ivory }}>
+                <SummaryItem icon={<Package size={20} />} label="누적 매입" value={`${fmt(overall.totalBoxes)} 박스`} />
+                <SummaryItem icon={<Scale size={20} />} label="총 중량"
+                  value={overall.totalGrams > 0
+                    ? overall.totalGrams >= 1000000 ? `${fmt2(overall.totalGrams / 1000000)} 톤` : `${fmt(overall.totalGrams / 1000)} kg`
+                    : '—'} />
+                <SummaryItem icon={<Activity size={20} />} label="거래 건수" value={`${fmt(purchases.length)} 건`} />
+                <SummaryItem icon={<CalendarDays size={20} />} label="기록 연도" value={allYears.length > 0 ? `${allYears.length} 년` : '—'} />
+              </section>
+            )}
+
+            {/* PACKAGING BREAKDOWN */}
+            <section className="mb-10">
+              <div className="flex items-center gap-2 mb-5">
+                <Layers size={18} style={{ color: C.forest }} />
+                <h2 className="serif text-2xl font-bold" style={{ color: C.forestDeep }}>포장 단위별 매입 현황</h2>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                {byPackaging.map((p) => <PackagingCard key={p.type} data={p} target={targetPrice} />)}
+              </div>
+            </section>
+
+            {/* INPUT FORM + CHART */}
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-10">
+              <div className="lg:col-span-1 p-7 rounded-sm relative grain"
+                style={{ background: '#fff', border: `1px solid ${C.oliveLight}`, boxShadow: '0 2px 8px rgba(45, 74, 43, 0.04)' }}>
+                <div className="flex items-center gap-2 mb-5">
+                  <Plus size={18} style={{ color: C.forest }} />
+                  <h2 className="serif text-2xl font-bold" style={{ color: C.forestDeep }}>새 매입 기록</h2>
+                </div>
+                <form onSubmit={handleAdd} className="space-y-4 relative">
+                  <Field label="매입 일자">
+                    <input type="date" value={date} min="2026-01-01" max="2999-12-31"
+                      onChange={(e) => setDate(e.target.value)} required
+                      className="w-full px-3 py-2.5 text-sm rounded-sm outline-none transition num"
+                      style={{ background: C.ivory, border: `1px solid ${C.olive}`, color: C.ink }} />
+                  </Field>
+                  <Field label="포장 단위">
+                    <div className="grid grid-cols-2 gap-2">
+                      {Object.entries(PACKAGING).map(([key, info]) => {
+                        const active = packagingType === key;
+                        return (
+                          <button key={key} type="button" onClick={() => setPackagingType(key)}
+                            className="py-2.5 px-3 rounded-sm text-sm font-medium transition-all"
+                            style={{ background: active ? C.forest : '#fff', color: active ? C.ivory : C.forestDeep, border: `1px solid ${active ? C.forest : C.olive}` }}>
+                            <div className="serif font-bold">{info.label}</div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </Field>
+                  <Field label={<span className="flex items-center justify-between"><span>박스 중량 (g)</span><span className="text-[10px] normal-case tracking-normal" style={{ color: C.olive }}>g당 단가 산출 기준</span></span>}>
+                    <input type="number" inputMode="decimal" min="0" step="1" value={boxWeightGrams}
+                      onChange={(e) => syncFromWeight(e.target.value)} placeholder="예) 6,000"
+                      className="w-full px-3 py-2.5 text-sm rounded-sm outline-none num"
+                      style={{ background: C.ivory, border: `1px solid ${C.olive}`, color: C.ink }} />
+                  </Field>
+                  <Field label="박스당 단가 (원)">
+                    <input type="number" inputMode="decimal" min="0" step="1" value={pricePerBox}
+                      onChange={(e) => syncFromBox(e.target.value)} placeholder="예) 50,000" required
+                      className="w-full px-3 py-2.5 text-sm rounded-sm outline-none num"
+                      style={{ background: C.ivory, border: `1px solid ${C.olive}`, color: C.ink }} />
+                  </Field>
+                  <Field label={<span className="flex items-center justify-between"><span>g당 단가 (원/g)</span><span className="text-[10px] normal-case tracking-normal" style={{ color: C.olive }}>⇄ 박스 단가와 자동 연동</span></span>}>
+                    <input type="number" inputMode="decimal" min="0" step="0.01" value={pricePerGram}
+                      onChange={(e) => syncFromGram(e.target.value)} placeholder="예) 8.33"
+                      className="w-full px-3 py-2.5 text-sm rounded-sm outline-none num"
+                      style={{ background: C.ivory, border: `1px solid ${C.olive}`, color: C.ink }} />
+                  </Field>
+                  <Field label="박스 수">
+                    <input type="number" inputMode="numeric" min="1" step="1" value={boxes}
+                      onChange={(e) => setBoxes(e.target.value)} placeholder="10" required
+                      className="w-full px-3 py-2.5 text-sm rounded-sm outline-none num"
+                      style={{ background: C.ivory, border: `1px solid ${C.olive}`, color: C.ink }} />
+                  </Field>
+                  <Field label="거래처 (선택)">
+                    <input type="text" value={supplier} onChange={(e) => setSupplier(e.target.value)}
+                      placeholder="예) 광천김 본가"
+                      className="w-full px-3 py-2.5 text-sm rounded-sm outline-none"
+                      style={{ background: C.ivory, border: `1px solid ${C.olive}`, color: C.ink }} />
+                  </Field>
+                  <Field label="메모 (선택)">
+                    <input type="text" value={memo} onChange={(e) => setMemo(e.target.value)}
+                      placeholder="등급, 용도 등"
+                      className="w-full px-3 py-2.5 text-sm rounded-sm outline-none"
+                      style={{ background: C.ivory, border: `1px solid ${C.olive}`, color: C.ink }} />
+                  </Field>
+                  {pricePerBox && boxes && (
+                    <div className="p-3 rounded-sm text-sm space-y-1" style={{ background: C.ivoryDeep, color: C.forestDeep }}>
+                      <div className="flex justify-between items-center">
+                        <span style={{ color: C.sage }}>총 매입액</span>
+                        <span className="serif font-bold text-lg num">
+                          {fmtPrice(parseFloat(pricePerBox || 0) * parseInt(boxes || 0, 10))}
+                        </span>
+                      </div>
+                      {boxWeightGrams && (
+                        <div className="flex justify-between items-center text-xs">
+                          <span style={{ color: C.sage }}>총 중량</span>
+                          <span className="num">
+                            {fmt(parseInt(boxes || 0, 10) * parseFloat(boxWeightGrams || 0))}g
+                            <span className="ml-1" style={{ color: C.sage, opacity: 0.7 }}>
+                              ({fmt2((parseInt(boxes || 0, 10) * parseFloat(boxWeightGrams || 0)) / 1000)}kg)
+                            </span>
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  <button type="submit" className="w-full py-3 rounded-sm font-medium text-sm transition-all hover:opacity-90"
+                    style={{ background: C.forest, color: C.ivory, letterSpacing: '0.05em' }}>
+                    장부에 기록하기
+                  </button>
+                </form>
+              </div>
+
+              <div className="lg:col-span-2 p-7 rounded-sm relative grain"
+                style={{ background: '#fff', border: `1px solid ${C.oliveLight}`, boxShadow: '0 2px 8px rgba(45, 74, 43, 0.04)' }}>
+                <div className="flex items-center justify-between mb-5 flex-wrap gap-3">
+                  <h2 className="serif text-2xl font-bold" style={{ color: C.forestDeep }}>연도별 추이</h2>
+                  <div className="flex items-center gap-4 text-xs" style={{ color: C.sage }}>
+                    <LegendDot color={C.olive} label="박스 수" square />
+                    <LegendDot color={C.forest} label="평균 박스가" />
+                    {targetPrice > 0 && <LegendDot color={C.rust} label="적정가" dashed />}
+                  </div>
+                </div>
+                {yearlyStats.length === 0 ? <EmptyChart /> : (
+                  <div style={{ width: '100%', height: 360 }}>
+                    <ResponsiveContainer>
+                      <ComposedChart data={yearlyStats} margin={{ top: 20, right: 20, bottom: 10, left: 10 }}>
+                        <defs>
+                          <linearGradient id="boxGradient" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="0%" stopColor={C.olive} stopOpacity={0.95} />
+                            <stop offset="100%" stopColor={C.olive} stopOpacity={0.55} />
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid stroke={C.oliveLight} strokeDasharray="2 4" vertical={false} />
+                        <XAxis dataKey="year" tick={{ fill: C.sage, fontSize: 12 }} axisLine={{ stroke: C.olive }} tickLine={false} />
+                        <YAxis yAxisId="left" tick={{ fill: C.sage, fontSize: 11 }} axisLine={false} tickLine={false}
+                          tickFormatter={(v) => fmt(v)}
+                          label={{ value: '박스 수', angle: -90, position: 'insideLeft', style: { fill: C.sage, fontSize: 11 } }} />
+                        <YAxis yAxisId="right" orientation="right" tick={{ fill: C.sage, fontSize: 11 }} axisLine={false} tickLine={false}
+                          tickFormatter={(v) => `${fmt(v / 1000)}천`}
+                          label={{ value: '단가 (원)', angle: 90, position: 'insideRight', style: { fill: C.sage, fontSize: 11 } }} />
+                        <Tooltip contentStyle={{ background: C.ivory, border: `1px solid ${C.olive}`, borderRadius: '2px', fontSize: '12px' }}
+                          labelStyle={{ color: C.forestDeep, fontWeight: 700 }}
+                          formatter={(value, name) => name === '박스 수' ? [`${fmt(value)} 박스`, name] : [fmtPrice(value), name]} />
+                        <Bar yAxisId="left" dataKey="totalBoxes" name="박스 수" fill="url(#boxGradient)" radius={[3, 3, 0, 0]} maxBarSize={60} />
+                        <Line yAxisId="right" type="monotone" dataKey="avgPrice" name="평균 박스가" stroke={C.forest} strokeWidth={2.5}
+                          dot={{ r: 4, fill: C.forest, stroke: C.ivory, strokeWidth: 2 }} activeDot={{ r: 6 }} />
+                        {targetPrice > 0 && <ReferenceLine yAxisId="right" y={targetPrice} stroke={C.rust} strokeDasharray="4 4" strokeWidth={1.5} />}
+                      </ComposedChart>
+                    </ResponsiveContainer>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* TIMELINE */}
+            {recentTrend.length >= 2 && (
+              <section className="mb-10">
+                <div className="flex items-center gap-2 mb-5">
+                  <Activity size={18} style={{ color: C.forest }} />
+                  <h2 className="serif text-2xl font-bold" style={{ color: C.forestDeep }}>최근 가격 흐름</h2>
+                  <span className="text-xs ml-2" style={{ color: C.sage }}>(최근 {recentTrend.length}건)</span>
+                </div>
+                <div className="p-6 rounded-sm relative grain" style={{ background: '#fff', border: `1px solid ${C.oliveLight}` }}>
+                  <div style={{ width: '100%', height: 200 }}>
+                    <ResponsiveContainer>
+                      <AreaChart data={recentTrend} margin={{ top: 10, right: 10, bottom: 10, left: 10 }}>
+                        <defs>
+                          <linearGradient id="trendGradient" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="0%" stopColor={C.forest} stopOpacity={0.4} />
+                            <stop offset="100%" stopColor={C.forest} stopOpacity={0} />
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid stroke={C.oliveLight} strokeDasharray="2 4" vertical={false} />
+                        <XAxis dataKey="date" tick={{ fill: C.sage, fontSize: 10 }} axisLine={{ stroke: C.olive }} tickLine={false} />
+                        <YAxis tick={{ fill: C.sage, fontSize: 10 }} axisLine={false} tickLine={false} tickFormatter={(v) => `${fmt(v / 1000)}천`} />
+                        <Tooltip contentStyle={{ background: C.ivory, border: `1px solid ${C.olive}`, borderRadius: '2px', fontSize: '12px' }}
+                          formatter={(v) => [fmtPrice(v), '박스 단가']} />
+                        {targetPrice > 0 && (
+                          <ReferenceLine y={targetPrice} stroke={C.rust} strokeDasharray="4 4" strokeWidth={1.2}
+                            label={{ value: '적정가', position: 'right', fill: C.rust, fontSize: 10 }} />
+                        )}
+                        <Area type="monotone" dataKey="box" stroke={C.forest} strokeWidth={2} fill="url(#trendGradient)"
+                          dot={{ r: 3, fill: C.forest, stroke: C.ivory, strokeWidth: 1.5 }} />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+              </section>
+            )}
+
+            {/* HEATMAP */}
+            {monthlyHeatmap && (
+              <section className="mb-10">
+                <div className="flex items-center gap-2 mb-5">
+                  <CalendarDays size={18} style={{ color: C.forest }} />
+                  <h2 className="serif text-2xl font-bold" style={{ color: C.forestDeep }}>월별 매입 히트맵</h2>
+                  <span className="text-xs ml-2" style={{ color: C.sage }}>(셀 색이 짙을수록 매입량 많음)</span>
+                </div>
+                <div className="p-6 rounded-sm relative grain overflow-x-auto" style={{ background: '#fff', border: `1px solid ${C.oliveLight}` }}>
+                  <div className="min-w-[600px]">
+                    <div className="grid gap-1.5" style={{ gridTemplateColumns: '50px repeat(12, 1fr)' }}>
+                      <div></div>
+                      {MONTHS.map((m) => (
+                        <div key={m} className="text-center text-[10px] uppercase tracking-wider pb-2" style={{ color: C.sage }}>{m}</div>
+                      ))}
+                      {monthlyHeatmap.years.map((y) => (
+                        <Fragment key={y}>
+                          <div className="serif text-sm font-bold flex items-center" style={{ color: C.forestDeep }}>{y}</div>
+                          {[1,2,3,4,5,6,7,8,9,10,11,12].map((m) => {
+                            const cell = monthlyHeatmap.map[`${y}-${m}`];
+                            const intensity = cell ? Math.max(0.15, cell.boxes / monthlyHeatmap.maxCount) : 0;
+                            return (
+                              <div key={m}
+                                className="aspect-square rounded-sm flex items-center justify-center text-[10px] num font-medium transition-all hover:scale-110"
+                                style={{
+                                  background: cell ? `rgba(45, 74, 43, ${intensity})` : C.oliveSoft,
+                                  color: cell && intensity > 0.5 ? C.ivory : C.forestDeep,
+                                  border: `1px solid ${cell ? 'transparent' : C.oliveLight}`,
+                                }}
+                                title={cell ? `${y}년 ${m}월 — ${cell.boxes}박스 (${cell.count}건)` : `${y}년 ${m}월 — 매입 없음`}>
+                                {cell ? fmt(cell.boxes) : ''}
+                              </div>
+                            );
+                          })}
+                        </Fragment>
+                      ))}
+                    </div>
+                    <div className="mt-5 flex items-center gap-2 justify-end text-[10px]" style={{ color: C.sage }}>
+                      <span>적음</span>
+                      {[0.15, 0.3, 0.5, 0.7, 0.9].map((op) => (
+                        <span key={op} style={{ width: 14, height: 14, background: `rgba(45, 74, 43, ${op})`, display: 'inline-block', borderRadius: 2 }} />
+                      ))}
+                      <span>많음</span>
+                    </div>
+                  </div>
+                </div>
+              </section>
+            )}
+
+            {/* YEARLY DETAIL */}
+            {yearlyStats.length > 0 && (
+              <section className="mb-10">
+                <h2 className="serif text-2xl font-bold mb-5" style={{ color: C.forestDeep }}>연도별 상세</h2>
+                <div className="rounded-sm overflow-hidden" style={{ background: '#fff', border: `1px solid ${C.oliveLight}` }}>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr style={{ background: C.ivoryDeep, color: C.sage }}>
+                          <Th>연도</Th><Th align="right">매입 박스</Th><Th align="right">평균 박스가</Th>
+                          <Th align="right">평균 g당가</Th><Th align="right">박스 최저</Th>
+                          <Th align="right">박스 최고</Th><Th align="right">거래</Th><Th align="right">적정가 대비</Th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {[...yearlyStats].reverse().map((y) => {
+                          const diff = targetPrice ? y.avgPrice - targetPrice : null;
+                          return (
+                            <tr key={y.year} style={{ borderTop: `1px solid ${C.oliveLight}` }}>
+                              <Td><span className="serif font-bold text-base" style={{ color: C.forestDeep }}>{y.year}</span></Td>
+                              <Td align="right" mono>{fmt(y.totalBoxes)} 박스</Td>
+                              <Td align="right" mono bold>{fmtPrice(y.avgPrice)}</Td>
+                              <Td align="right" mono>{y.avgGramPrice > 0 ? fmtGramPrice(y.avgGramPrice) : <span style={{ color: C.sage }}>—</span>}</Td>
+                              <Td align="right" mono><span style={{ color: C.forest }}>{fmtPrice(y.minPrice)}</span></Td>
+                              <Td align="right" mono><span style={{ color: C.rust }}>{fmtPrice(y.maxPrice)}</span></Td>
+                              <Td align="right" mono>{y.transactions}회</Td>
+                              <Td align="right" mono>
+                                {diff === null ? <span style={{ color: C.sage }}>—</span> :
+                                  <span style={{ color: diff > 0 ? C.rust : C.forest, fontWeight: 600 }}>
+                                    {diff >= 0 ? '+' : ''}{fmt(diff)}원
+                                  </span>}
+                              </Td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </section>
+            )}
+
+            {/* TRANSACTION LOG */}
+            <section>
+              <div className="flex items-center justify-between mb-5 flex-wrap gap-3">
+                <h2 className="serif text-2xl font-bold" style={{ color: C.forestDeep }}>매입 기록</h2>
+                <div className="flex items-center gap-3 flex-wrap">
+                  <select value={filterPackaging} onChange={(e) => setFilterPackaging(e.target.value)}
+                    className="px-3 py-2 text-sm rounded-sm outline-none"
+                    style={{ background: '#fff', border: `1px solid ${C.olive}`, color: C.forestDeep }}>
+                    <option value="all">모든 포장</option>
+                    <option value="60sok">60속만</option>
+                    <option value="72sok">72속만</option>
+                  </select>
+                  <select value={filterYear} onChange={(e) => setFilterYear(e.target.value)}
+                    className="px-3 py-2 text-sm rounded-sm outline-none"
+                    style={{ background: '#fff', border: `1px solid ${C.olive}`, color: C.forestDeep }}>
+                    <option value="all">전체 연도</option>
+                    {allYears.slice().reverse().map((y) => <option key={y} value={y}>{y}년</option>)}
+                  </select>
+                </div>
+              </div>
+
+              {(filterYear !== 'all' || filterPackaging !== 'all') && filtered.length > 0 && (
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5 p-4 rounded-sm"
+                  style={{ background: C.ivoryDeep, border: `1px solid ${C.oliveLight}` }}>
+                  <MiniStat label="필터 평균 박스가" value={fmtPrice(filteredStats.avgBox)} />
+                  <MiniStat label="필터 평균 g당가" value={filteredStats.avgGram > 0 ? fmtGramPrice(filteredStats.avgGram) : '—'} />
+                  <MiniStat label="박스 최저 / 최고" value={`${fmt(filteredStats.minBox)} / ${fmt(filteredStats.maxBox)}원`} />
+                  <MiniStat label="총 박스" value={`${fmt(filteredStats.boxes)} 박스`} />
+                </div>
+              )}
+
+              {filtered.length === 0 ? <EmptyLog /> : (
+                <div className="rounded-sm overflow-hidden" style={{ background: '#fff', border: `1px solid ${C.oliveLight}` }}>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr style={{ background: C.ivoryDeep, color: C.sage }}>
+                          <Th>일자</Th><Th>포장</Th><Th align="right">중량</Th>
+                          <Th align="right">박스 단가</Th><Th align="right">g당 단가</Th>
+                          <Th align="right">박스 수</Th><Th align="right">매입액</Th>
+                          <Th>거래처 / 메모</Th><Th align="center">대비</Th><Th align="center"></Th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {filtered.map((p) => {
+                          const total = p.pricePerBox * p.boxes;
+                          const vsTarget = targetPrice ? p.pricePerBox - targetPrice : null;
+                          const pkgType = p.packagingType || '60sok';
+                          const pkgInfo = PACKAGING[pkgType];
+                          return (
+                            <tr key={p.id} style={{ borderTop: `1px solid ${C.oliveLight}` }} className="hover:bg-stone-50 transition">
+                              <Td mono>
+                                <Calendar size={12} className="inline mr-1.5 -mt-0.5" style={{ color: C.sage }} />{p.date}
+                              </Td>
+                              <Td>
+                                <span className="text-xs px-2 py-1 rounded-sm font-medium"
+                                  style={{ background: pkgType === '60sok' ? '#eaefe5' : '#f3ecd9', color: pkgType === '60sok' ? C.forest : C.warm }}>
+                                  {pkgInfo.label}
+                                </span>
+                              </Td>
+                              <Td align="right" mono>{p.boxWeightGrams > 0 ? `${fmt(p.boxWeightGrams)}g` : <span style={{ color: C.sage }}>—</span>}</Td>
+                              <Td align="right" mono bold>{fmtPrice(p.pricePerBox)}</Td>
+                              <Td align="right" mono>{p.pricePerGram > 0 ? fmtGramPrice(p.pricePerGram) : <span style={{ color: C.sage }}>—</span>}</Td>
+                              <Td align="right" mono>{fmt(p.boxes)}</Td>
+                              <Td align="right" mono>{fmtPrice(total)}</Td>
+                              <Td>
+                                <div style={{ color: C.forestDeep, fontWeight: 500 }}>{p.supplier || '—'}</div>
+                                {p.memo && <div className="text-xs mt-0.5" style={{ color: C.sage }}>{p.memo}</div>}
+                              </Td>
+                              <Td align="center">
+                                {vsTarget === null ? <span style={{ color: C.sage }}>—</span> :
+                                  <span className="text-xs px-2 py-1 rounded-sm num"
+                                    style={{ background: vsTarget > 0 ? '#fbeceb' : '#eaefe5', color: vsTarget > 0 ? C.rust : C.forest, fontWeight: 600 }}>
+                                    {vsTarget >= 0 ? '+' : ''}{fmt(vsTarget)}원
+                                  </span>}
+                              </Td>
+                              <Td align="center">
+                                <button onClick={() => handleDelete(p.id)} className="p-2 rounded-sm transition hover:opacity-70"
+                                  style={{ color: C.sage }} title="삭제">
+                                  <Trash2 size={14} />
+                                </button>
+                              </Td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </section>
+
+            <footer className="mt-12 pt-6 text-center text-xs" style={{ color: C.sage, borderTop: `1px solid ${C.oliveLight}` }}>
+              <p className="serif italic">
+                "値段は静かに記録される" — 단가는 조용히 기록된다 · {purchases.length}건의 거래가 보존되었습니다
+              </p>
+            </footer>
+          </div>
+
+          {showSettings && (
+            <Modal onClose={() => setShowSettings(false)}>
+              <div className="flex items-center gap-2 mb-2">
+                <Target size={18} style={{ color: C.forest }} />
+                <h3 className="serif text-2xl font-bold" style={{ color: C.forestDeep }}>적정 단가 설정</h3>
+              </div>
+              <p className="text-sm mb-5" style={{ color: C.sage }}>
+                매입 시 기준이 되는 박스당 적정 가격을 입력하세요.
+              </p>
+              <input type="number" min="0" step="100" value={targetInput}
+                onChange={(e) => setTargetInput(e.target.value)}
+                placeholder="50,000" autoFocus
+                className="w-full px-4 py-3 text-lg rounded-sm outline-none num serif"
+                style={{ background: '#fff', border: `1px solid ${C.olive}`, color: C.forestDeep }} />
+              <div className="flex gap-3 mt-5">
+                <button onClick={() => setShowSettings(false)} className="flex-1 py-2.5 rounded-sm text-sm transition hover:opacity-80"
+                  style={{ border: `1px solid ${C.olive}`, color: C.sage }}>취소</button>
+                <button onClick={handleSaveTarget} className="flex-1 py-2.5 rounded-sm text-sm font-medium transition hover:opacity-90"
+                  style={{ background: C.forest, color: C.ivory }}>저장</button>
+              </div>
+            </Modal>
+          )}
+
+          {showSync && (
+            <SyncSettingsModal
+              onClose={() => setShowSync(false)}
+              connected={!!sheetsUrl}
+              currentUrl={sheetsUrl}
+              status={syncStatus}
+              message={syncMessage}
+              lastSyncTime={lastSyncTime}
+              onConnect={handleSyncConnect}
+              onDisconnect={handleSyncDisconnect}
+              onManualSync={handleManualSync}
+            />
+          )}
+        </div>
+      );
+    }
+
+    // ──────────────── SyncIndicator ────────────────
+    function SyncIndicator({ status, connected, onClick, onRefresh, lastSyncTime }) {
+      const config = (() => {
+        if (!connected) return { icon: <CloudOff size={14} />, label: '동기화 안됨', color: C.sage, bg: '#fff', border: C.olive };
+        if (status === 'syncing') return { icon: <RefreshCw size={14} className="spin-anim" />, label: '동기화 중', color: C.cloud, bg: '#eaf0f8', border: C.cloud };
+        if (status === 'error') return { icon: <AlertCircle size={14} />, label: '오류', color: C.rust, bg: '#fbeceb', border: C.rust };
+        if (status === 'synced') return { icon: <Check size={14} />, label: '동기화됨', color: C.forest, bg: '#eaefe5', border: C.forest };
+        return { icon: <Cloud size={14} />, label: '연결됨', color: C.cloud, bg: '#fff', border: C.cloud };
+      })();
+
+      return (
+        <div className="flex items-center gap-1">
+          <button onClick={onClick}
+            className="flex items-center gap-2 px-3 py-3 rounded-sm transition-all hover:opacity-90 text-xs"
+            style={{ background: config.bg, border: `1px solid ${config.border}`, color: config.color }}
+            title={lastSyncTime ? `마지막 동기화: ${new Date(lastSyncTime).toLocaleTimeString('ko-KR')}` : '클릭하여 설정'}>
+            {config.icon}
+            <span className="hidden sm:inline">{config.label}</span>
+          </button>
+          {connected && status !== 'syncing' && (
+            <button onClick={onRefresh} title="시트에서 다시 불러오기"
+              className="p-3 rounded-sm transition hover:opacity-70"
+              style={{ color: C.sage, border: `1px solid ${C.olive}`, background: '#fff' }}>
+              <RefreshCw size={14} />
+            </button>
+          )}
+        </div>
+      );
+    }
+
+    // ──────────────── SyncSettingsModal ────────────────
+    function SyncSettingsModal({ onClose, connected, currentUrl, status, message, lastSyncTime, onConnect, onDisconnect, onManualSync }) {
+      const [urlInput, setUrlInput] = useState(currentUrl || '');
+      const [busy, setBusy] = useState(false);
+      const [step, setStep] = useState(connected ? 'status' : 'guide'); // guide | url | status
+      const [copied, setCopied] = useState(false);
+
+      function copyCode() {
+        navigator.clipboard.writeText(APPS_SCRIPT_CODE).then(() => {
+          setCopied(true);
+          setTimeout(() => setCopied(false), 2000);
+        });
+      }
+
+      async function handleConnect() {
+        if (!urlInput.trim()) return;
+        setBusy(true);
+        const r = await onConnect(urlInput.trim());
+        setBusy(false);
+        if (r.ok) {
+          setStep('status');
+        }
+      }
+
+      return (
+        <Modal onClose={onClose} maxWidth="max-w-2xl">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <Cloud size={20} style={{ color: C.forest }} />
+              <h3 className="serif text-2xl font-bold" style={{ color: C.forestDeep }}>구글 시트 동기화</h3>
+            </div>
+            <button onClick={onClose} className="p-1 hover:opacity-70" style={{ color: C.sage }}>
+              <X size={18} />
+            </button>
+          </div>
+
+          {connected && step === 'status' && (
+            <div className="space-y-4">
+              <div className="p-4 rounded-sm flex items-center gap-3"
+                style={{ background: '#eaefe5', border: `1px solid ${C.forest}` }}>
+                <Check size={20} style={{ color: C.forest }} />
+                <div className="flex-1">
+                  <div className="font-bold text-sm" style={{ color: C.forestDeep }}>연결됨</div>
+                  <div className="text-xs mt-0.5 break-all num" style={{ color: C.sage }}>
+                    {currentUrl}
+                  </div>
+                  {lastSyncTime && (
+                    <div className="text-[11px] mt-1" style={{ color: C.sage }}>
+                      마지막 동기화: {new Date(lastSyncTime).toLocaleString('ko-KR')}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {status === 'error' && message && (
+                <div className="p-3 rounded-sm text-xs" style={{ background: '#fbeceb', color: C.rust, border: `1px solid ${C.rust}` }}>
+                  <strong>오류:</strong> {message}
+                </div>
+              )}
+
+              <div className="space-y-2">
+                <button onClick={() => { onManualSync(); }}
+                  className="w-full py-2.5 rounded-sm text-sm font-medium transition hover:opacity-90 flex items-center justify-center gap-2"
+                  style={{ background: C.forest, color: C.ivory }}>
+                  <RefreshCw size={14} /> 시트에서 다시 불러오기
+                </button>
+                <button onClick={() => setStep('guide')}
+                  className="w-full py-2 rounded-sm text-xs transition hover:opacity-80"
+                  style={{ border: `1px solid ${C.olive}`, color: C.sage }}>
+                  설정 다시 보기 / URL 변경
+                </button>
+                <button onClick={onDisconnect}
+                  className="w-full py-2 rounded-sm text-xs transition hover:opacity-80"
+                  style={{ border: `1px solid ${C.rust}`, color: C.rust }}>
+                  동기화 해제
+                </button>
+              </div>
+            </div>
+          )}
+
+          {step === 'guide' && (
+            <div className="space-y-4">
+              <p className="text-sm" style={{ color: C.sage }}>
+                구글 시트에 데이터를 자동 저장하면 PC, 휴대폰, 태블릿 어디서든 같은 데이터를 보고 입력할 수 있습니다. 처음 한 번만 설정하면 됩니다.
+              </p>
+
+              <div className="rounded-sm p-4 space-y-3" style={{ background: C.ivoryDeep, border: `1px solid ${C.oliveLight}` }}>
+                <div className="text-xs uppercase tracking-wider font-bold" style={{ color: C.forestDeep }}>설정 순서 (약 5분)</div>
+                <ol className="space-y-2 text-sm" style={{ color: C.ink }}>
+                  <li className="flex gap-2">
+                    <span className="font-bold flex-shrink-0" style={{ color: C.forest }}>1.</span>
+                    <span>
+                      <a href="https://sheets.new" target="_blank" rel="noopener" className="underline inline-flex items-center gap-1" style={{ color: C.cloud }}>
+                        sheets.new <ExternalLink size={11} />
+                      </a> 에서 새 구글 시트 만들기
+                    </span>
+                  </li>
+                  <li className="flex gap-2">
+                    <span className="font-bold flex-shrink-0" style={{ color: C.forest }}>2.</span>
+                    <span>상단 메뉴 → <strong>확장 프로그램</strong> → <strong>Apps Script</strong> 클릭</span>
+                  </li>
+                  <li className="flex gap-2">
+                    <span className="font-bold flex-shrink-0" style={{ color: C.forest }}>3.</span>
+                    <span>기존 코드 전부 지우고, 아래 코드 복사 → 붙여넣기 → 저장 (Ctrl+S)</span>
+                  </li>
+                </ol>
+
+                <div className="relative">
+                  <button onClick={copyCode}
+                    className="absolute top-2 right-2 z-10 px-2 py-1 rounded-sm text-[10px] flex items-center gap-1 transition hover:opacity-80"
+                    style={{ background: copied ? C.forest : C.sage, color: C.ivory }}>
+                    {copied ? <><Check size={11} /> 복사됨</> : <><Copy size={11} /> 코드 복사</>}
+                  </button>
+                  <pre className="code-block">{APPS_SCRIPT_CODE}</pre>
+                </div>
+
+                <ol className="space-y-2 text-sm" style={{ color: C.ink }} start="4">
+                  <li className="flex gap-2">
+                    <span className="font-bold flex-shrink-0" style={{ color: C.forest }}>4.</span>
+                    <span>우측 상단 <strong>배포</strong> → <strong>새 배포</strong> 클릭</span>
+                  </li>
+                  <li className="flex gap-2">
+                    <span className="font-bold flex-shrink-0" style={{ color: C.forest }}>5.</span>
+                    <span>톱니바퀴 → 유형 <strong>"웹 앱"</strong> 선택</span>
+                  </li>
+                  <li className="flex gap-2">
+                    <span className="font-bold flex-shrink-0" style={{ color: C.forest }}>6.</span>
+                    <span>액세스 권한: <strong>"모든 사용자"</strong>로 설정 후 배포</span>
+                  </li>
+                  <li className="flex gap-2">
+                    <span className="font-bold flex-shrink-0" style={{ color: C.forest }}>7.</span>
+                    <span>권한 승인 (본인 구글 계정으로 인증)</span>
+                  </li>
+                  <li className="flex gap-2">
+                    <span className="font-bold flex-shrink-0" style={{ color: C.forest }}>8.</span>
+                    <span>발급된 <strong>웹 앱 URL</strong>을 복사 (https://script.google.com/...)</span>
+                  </li>
+                </ol>
+              </div>
+
+              <button onClick={() => setStep('url')}
+                className="w-full py-2.5 rounded-sm text-sm font-medium transition hover:opacity-90"
+                style={{ background: C.forest, color: C.ivory }}>
+                URL 입력하러 가기 →
+              </button>
+            </div>
+          )}
+
+          {step === 'url' && (
+            <div className="space-y-4">
+              <div>
+                <label className="block text-xs uppercase tracking-wider mb-2" style={{ color: C.sage }}>
+                  웹 앱 URL
+                </label>
+                <input type="url" value={urlInput} onChange={(e) => setUrlInput(e.target.value)}
+                  placeholder="https://script.google.com/macros/s/.../exec"
+                  className="w-full px-3 py-3 text-sm rounded-sm outline-none num"
+                  style={{ background: '#fff', border: `1px solid ${C.olive}`, color: C.ink }} />
+              </div>
+
+              {message && status === 'error' && (
+                <div className="p-3 rounded-sm text-xs" style={{ background: '#fbeceb', color: C.rust, border: `1px solid ${C.rust}` }}>
+                  <strong>연결 실패:</strong> {message}
+                  <div className="mt-1 opacity-80">URL이 정확한지, "모든 사용자" 권한으로 배포했는지 확인해주세요.</div>
+                </div>
+              )}
+
+              <div className="flex gap-2">
+                <button onClick={() => setStep('guide')} disabled={busy}
+                  className="flex-1 py-2.5 rounded-sm text-sm transition hover:opacity-80"
+                  style={{ border: `1px solid ${C.olive}`, color: C.sage }}>
+                  ← 설정 보기
+                </button>
+                <button onClick={handleConnect} disabled={busy || !urlInput.trim()}
+                  className="flex-[2] py-2.5 rounded-sm text-sm font-medium transition hover:opacity-90 flex items-center justify-center gap-2"
+                  style={{
+                    background: busy ? C.sage : C.forest,
+                    color: C.ivory,
+                    opacity: !urlInput.trim() ? 0.5 : 1,
+                  }}>
+                  {busy ? <><RefreshCw size={14} className="spin-anim" /> 연결 중…</> : '연결'}
+                </button>
+              </div>
+            </div>
+          )}
+        </Modal>
+      );
+    }
+
+    function Modal({ children, onClose, maxWidth = 'max-w-md' }) {
+      return (
+        <div className="fixed inset-0 flex items-center justify-center p-4 z-50 overflow-y-auto"
+          style={{ background: 'rgba(26, 40, 24, 0.5)' }}
+          onClick={onClose}>
+          <div className={`w-full ${maxWidth} p-7 rounded-sm relative my-8`}
+            style={{ background: C.ivory, border: `1px solid ${C.forest}`, maxHeight: '90vh', overflowY: 'auto' }}
+            onClick={(e) => e.stopPropagation()}>
+            {children}
+          </div>
+        </div>
+      );
+    }
+
+    function HeroStat({ label, value, sub, accent, icon, trend }) {
+      const sparkPath = useMemo(() => {
+        if (!trend || trend.length < 2) return null;
+        const w = 80, h = 24;
+        const vals = trend.map((t) => t.v).filter((v) => v > 0);
+        if (vals.length < 2) return null;
+        const min = Math.min(...vals), max = Math.max(...vals);
+        const range = max - min || 1;
+        return vals.map((v, i) => {
+          const x = (i / (vals.length - 1)) * w;
+          const y = h - ((v - min) / range) * h;
+          return `${i === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
+        }).join(' ');
+      }, [trend]);
+      return (
+        <div className="p-5 rounded-sm relative overflow-hidden"
+          style={{ background: '#fff', border: `1px solid ${C.oliveLight}`, borderLeft: `3px solid ${accent}` }}>
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-xs uppercase tracking-wider" style={{ color: C.sage }}>{label}</span>
+            <span style={{ color: accent, opacity: 0.5 }}>{icon}</span>
+          </div>
+          <div className="serif text-2xl md:text-3xl font-bold num" style={{ color: C.forestDeep }}>{value}</div>
+          <div className="flex items-center justify-between mt-1.5 gap-2">
+            <div className="text-xs num" style={{ color: accent, opacity: 0.85 }}>{sub}</div>
+            {sparkPath && (
+              <svg width="80" height="24" className="flex-shrink-0">
+                <path d={sparkPath} stroke={accent} strokeWidth="1.5" fill="none" opacity="0.65" />
+              </svg>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    function SummaryItem({ icon, label, value }) {
+      return (
+        <div className="flex items-center gap-3">
+          <div className="opacity-70">{icon}</div>
+          <div>
+            <div className="text-[10px] uppercase tracking-wider opacity-70">{label}</div>
+            <div className="serif font-bold text-lg num">{value}</div>
+          </div>
+        </div>
+      );
+    }
+
+    function PackagingCard({ data, target }) {
+      const accent = data.type === '60sok' ? C.forest : C.warm;
+      return (
+        <div className="p-6 rounded-sm relative grain"
+          style={{ background: '#fff', border: `1px solid ${C.oliveLight}`, borderTop: `3px solid ${accent}` }}>
+          <div className="flex items-center justify-between mb-5 pb-3" style={{ borderBottom: `1px solid ${C.oliveLight}` }}>
+            <div>
+              <h3 className="serif text-2xl font-bold" style={{ color: C.forestDeep }}>{data.label}</h3>
+              {!data.empty && (
+                <p className="text-xs mt-0.5 num" style={{ color: C.sage }}>
+                  총 중량 {data.totalGrams > 0
+                    ? data.totalGrams >= 1000000 ? `${fmt2(data.totalGrams / 1000000)}톤` : `${fmt(data.totalGrams / 1000)}kg`
+                    : '미기록'}
+                </p>
+              )}
+            </div>
+            {!data.empty && (
+              <div className="text-right">
+                <div className="text-xs uppercase tracking-wider" style={{ color: C.sage }}>누적</div>
+                <div className="serif font-bold text-lg num" style={{ color: accent }}>{fmt(data.totalBoxes)}박스</div>
+                <div className="text-[10px] num" style={{ color: C.sage }}>{data.count}건의 거래</div>
+              </div>
+            )}
+          </div>
+          {data.empty ? (
+            <div className="py-8 text-center" style={{ color: C.sage }}>
+              <Package size={28} strokeWidth={1} className="mx-auto mb-2" style={{ opacity: 0.5 }} />
+              <p className="serif italic text-sm">매입 기록 없음</p>
+            </div>
+          ) : (
+            <div className="space-y-5">
+              <RangeBlock heading="박스 단가" min={data.minBoxPrice} max={data.maxBoxPrice} avg={data.avgBoxPrice}
+                target={target} unit="원" accent={accent} decimals={false} />
+              <RangeBlock heading="g당 단가" min={data.minGramPrice} max={data.maxGramPrice} avg={data.avgGramPrice}
+                unit="원/g" accent={accent} decimals />
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function RangeBlock({ heading, min, max, avg, target, unit, accent, decimals }) {
+      const fmtV = decimals ? fmt2 : fmt;
+      const hasData = min > 0 && max > 0;
+      const range = max - min || 1;
+      const avgPct = hasData ? ((avg - min) / range) * 100 : 0;
+      const targetPct = target && hasData ? ((target - min) / range) * 100 : null;
+      return (
+        <div>
+          <div className="flex items-baseline justify-between mb-2">
+            <div className="text-xs uppercase tracking-wider" style={{ color: C.sage, fontWeight: 600 }}>{heading}</div>
+            {hasData && (
+              <div className="text-xs num" style={{ color: C.sage }}>
+                평균 <span className="serif font-bold" style={{ color: accent }}>{fmtV(avg)}</span>
+                <span className="ml-1" style={{ opacity: 0.7 }}>{unit}</span>
+              </div>
+            )}
+          </div>
+          {!hasData ? (
+            <div className="py-4 text-center text-xs italic rounded-sm" style={{ background: C.ivoryDeep, color: C.sage }}>기록 없음</div>
+          ) : (
+            <Fragment>
+              <div className="relative mb-2 mt-3" style={{ height: 36 }}>
+                <div className="absolute left-0 right-0 rounded-full"
+                  style={{ top: 14, height: 8, background: `linear-gradient(90deg, ${C.forest}, ${C.olive}, ${C.rust})`, opacity: 0.85 }} />
+                <div className="absolute" style={{
+                  left: `${avgPct}%`, top: 6, width: 4, height: 24, background: C.forestDeep,
+                  transform: 'translateX(-50%)', borderRadius: 2, boxShadow: `0 0 0 2px ${C.ivory}`,
+                }} title={`평균 ${fmtV(avg)}${unit}`} />
+                {targetPct !== null && targetPct >= 0 && targetPct <= 100 && (
+                  <div className="absolute" style={{
+                    left: `${targetPct}%`, top: 0, width: 0, height: 36,
+                    borderLeft: `2px dashed ${C.rust}`, transform: 'translateX(-1px)',
+                  }} title={`적정가 ${fmtV(target)}${unit}`} />
+                )}
+              </div>
+              <div className="flex justify-between items-center text-xs">
+                <div>
+                  <div className="text-[10px] uppercase tracking-wider" style={{ color: C.forest, opacity: 0.7 }}>최저</div>
+                  <div className="serif font-bold num" style={{ color: C.forest, fontSize: 16 }}>
+                    {fmtV(min)}<span className="text-xs ml-0.5 font-normal" style={{ color: C.sage }}>{unit}</span>
+                  </div>
+                </div>
+                <div className="text-right">
+                  <div className="text-[10px] uppercase tracking-wider" style={{ color: C.rust, opacity: 0.7 }}>최고</div>
+                  <div className="serif font-bold num" style={{ color: C.rust, fontSize: 16 }}>
+                    {fmtV(max)}<span className="text-xs ml-0.5 font-normal" style={{ color: C.sage }}>{unit}</span>
+                  </div>
+                </div>
+              </div>
+            </Fragment>
+          )}
+        </div>
+      );
+    }
+
+    function Field({ label, children }) {
+      return (
+        <label className="block">
+          <span className="block text-xs uppercase tracking-wider mb-1.5" style={{ color: C.sage }}>{label}</span>
+          {children}
+        </label>
+      );
+    }
+    function Th({ children, align = 'left' }) {
+      return <th className="px-4 py-3 text-xs uppercase tracking-wider font-medium whitespace-nowrap" style={{ textAlign: align }}>{children}</th>;
+    }
+    function Td({ children, align = 'left', mono = false, bold = false }) {
+      return (
+        <td className={`px-4 py-3 ${mono ? 'num' : ''} ${bold ? 'font-bold' : ''} whitespace-nowrap`}
+          style={{ textAlign: align, color: C.ink }}>{children}</td>
+      );
+    }
+    function MiniStat({ label, value }) {
+      return (
+        <div>
+          <div className="text-xs uppercase tracking-wider mb-1" style={{ color: C.sage }}>{label}</div>
+          <div className="serif font-bold text-base num" style={{ color: C.forestDeep }}>{value}</div>
+        </div>
+      );
+    }
+    function LegendDot({ color, label, square = false, dashed = false }) {
+      return (
+        <span className="inline-flex items-center gap-1.5">
+          {square ? <span style={{ width: 10, height: 10, background: color, display: 'inline-block' }} /> :
+            dashed ? <span style={{ width: 14, height: 0, borderTop: `2px dashed ${color}`, display: 'inline-block' }} /> :
+            <span style={{ width: 14, height: 2, background: color, display: 'inline-block' }} />}
+          <span>{label}</span>
+        </span>
+      );
+    }
+    function EmptyChart() {
+      return (
+        <div className="flex flex-col items-center justify-center text-center" style={{ height: 360, color: C.sage }}>
+          <Leaf size={36} strokeWidth={1} className="mb-3" />
+          <p className="serif text-lg italic mb-1">아직 기록된 거래가 없습니다</p>
+          <p className="text-xs">왼쪽 양식에서 첫 매입을 기록해 보세요</p>
+        </div>
+      );
+    }
+    function EmptyLog() {
+      return (
+        <div className="p-12 text-center rounded-sm" style={{ background: '#fff', border: `1px dashed ${C.olive}`, color: C.sage }}>
+          <p className="serif text-base italic">조건에 해당하는 매입 기록이 없습니다.</p>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<KimPurchaseLedger />);
+  </script>
+</body>
+</html>
